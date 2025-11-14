@@ -841,6 +841,10 @@ class Model:
                 if forth_obj is not None:
                     forth_stash.pre_code.append("4 stream skip\n")
                 cursor.skip(4)
+                # Adjust num_bytes to account for version 0 format difference
+                # Version 0 objects have 1 extra byte compared to what num_bytes indicates
+                if self._num_bytes is not None:
+                    self._num_bytes += 1
 
         if context.get("reading", True):
             self.hook_before_read_members(
