@@ -844,6 +844,7 @@ class HasFields(Mapping):
                 stop_cluster_idx,
             )
 
+        column_readers = {}
         for key in target_cols:
             if "column" in key:
                 key_nr = int(key.split("-")[1])
@@ -851,16 +852,30 @@ class HasFields(Mapping):
                 n_padding = self.ntuple.column_records[key_nr].first_element_index
                 n_padding = max(n_padding - cluster_offset, 0)
                 dtype = None
+                dtype_byte = self.ntuple.column_records[key_nr].type
                 if interpreter == "cpu":
-                    content_generator = partial(
-                        self.ntuple.read_cluster_range,
-                        key_nr,
-                        start_cluster_idx,
-                        stop_cluster_idx,
-                        missing_element_padding=n_padding,
-                        array_cache=array_cache,
-                        access_log=access_log,
-                    )
+                    # A column can back several form keys, e.g. a collection's
+                    # offsets and its cardinality; read it only once.
+                    content_generator = column_readers.get(key_nr)
+                    if content_generator is None:
+                        content_generator = _read_once(
+                            partial(
+                                self.ntuple.read_cluster_range,
+                                key_nr,
+                                start_cluster_idx,
+                                stop_cluster_idx,
+                                missing_element_padding=n_padding,
+                                array_cache=array_cache,
+                                access_log=access_log,
+                            )
+                        )
+                        # switch columns are modified in place when filling
+                        # container_dict, so they are not shared
+                        if (
+                            dtype_byte
+                            != uproot.const.rntuple_col_type_to_num_dict["switch"]
+                        ):
+                            column_readers[key_nr] = content_generator
                     if virtual:
                         total_length, _, dtype = (
                             self.ntuple._expected_array_length_starts_dtype(
@@ -883,7 +898,6 @@ class HasFields(Mapping):
                     )
                 else:
                     raise NotImplementedError(f"Backend {backend} not implemented.")
-                dtype_byte = self.ntuple.column_records[key_nr].type
                 _fill_container_dict(container_dict, content, key, dtype_byte, dtype)
 
         arrays = ak.from_buffers(
@@ -1910,6 +1924,17 @@ def _regularize_step_size(ntuple, akform, step_size, entry_start, entry_stop):
         f"(such as '100 MB') required, not {step_size!r}",
     )
     return _num_entries_for(ntuple, akform, target_num_bytes, entry_start, entry_stop)
+
+
+def _read_once(read):
+    result = []
+
+    def generator():
+        if not result:
+            result.append(read())
+        return result[0]
+
+    return generator
 
 
 def _recursive_find(form, res):
