@@ -806,7 +806,11 @@ class HasFields(Mapping):
         start_cluster_idx = (
             numpy.searchsorted(cluster_starts, entry_start, side="right") - 1
         )
-        stop_cluster_idx = numpy.searchsorted(cluster_starts, entry_stop, side="right")
+        # entry_stop is exclusive: a cluster starting at entry_stop is not needed
+        stop_cluster_idx = max(
+            numpy.searchsorted(cluster_starts, entry_stop, side="left"),
+            start_cluster_idx + 1,
+        )
         cluster_num_entries = numpy.sum(
             [c.num_entries for c in clusters[start_cluster_idx:stop_cluster_idx]],
             dtype=int,
@@ -1877,7 +1881,11 @@ def _num_entries_for(ntuple, akform, target_num_bytes, entry_start, entry_stop):
     start_cluster_idx = (
         numpy.searchsorted(cluster_starts, entry_start, side="right") - 1
     )
-    stop_cluster_idx = numpy.searchsorted(cluster_starts, entry_stop, side="right")
+    # entry_stop is exclusive: a cluster starting at entry_stop is not needed
+    stop_cluster_idx = max(
+        numpy.searchsorted(cluster_starts, entry_stop, side="left"),
+        start_cluster_idx + 1,
+    )
 
     target_cols = []
     _recursive_find(akform, target_cols)
