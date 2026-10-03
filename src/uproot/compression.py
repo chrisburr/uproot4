@@ -89,7 +89,12 @@ class _DecompressZLIB:
     name = "ZLIB"
     _2byte = b"ZL"
     _method = b"\x08"
-    library = "zlib"  # options: "zlib", "isal", "deflate"
+
+    @property
+    def library(self):
+        # Reading goes through the module-level ``_decompress_ZLIB`` instance of
+        # this class, so defer to the documented ``ZLIB.library`` setting.
+        return ZLIB.library
 
     def decompress(self, data: bytes, uncompressed_bytes=None) -> bytes:
         if uncompressed_bytes is None:
@@ -129,7 +134,11 @@ class ZLIB(Compression, _DecompressZLIB):
     If ``ZLIB.library`` is ``"isal"``, Uproot uses ``isal.isal_zlib``.
 
     If ``ZLIB.library`` is ``"deflate"``, Uproot uses ``deflate.deflate_zlib``.
+
+    The setting applies to both reading and writing.
     """
+
+    library = "zlib"  # options: "zlib", "isal", "deflate"
 
     def __init__(self, level):
         _DecompressZLIB.__init__(self)
