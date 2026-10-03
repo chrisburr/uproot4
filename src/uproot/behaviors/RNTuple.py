@@ -806,7 +806,11 @@ class HasFields(Mapping):
         start_cluster_idx = (
             numpy.searchsorted(cluster_starts, entry_start, side="right") - 1
         )
-        stop_cluster_idx = numpy.searchsorted(cluster_starts, entry_stop, side="right")
+        # entry_stop is exclusive: a cluster starting at entry_stop is not needed
+        stop_cluster_idx = max(
+            numpy.searchsorted(cluster_starts, entry_stop, side="left"),
+            start_cluster_idx + 1,
+        )
         cluster_num_entries = numpy.sum(
             [c.num_entries for c in clusters[start_cluster_idx:stop_cluster_idx]],
             dtype=int,
@@ -844,6 +848,7 @@ class HasFields(Mapping):
                 stop_cluster_idx,
             )
 
+        column_readers = {}
         for key in target_cols:
             if "column" in key:
                 key_nr = int(key.split("-")[1])
@@ -851,16 +856,30 @@ class HasFields(Mapping):
                 n_padding = self.ntuple.column_records[key_nr].first_element_index
                 n_padding = max(n_padding - cluster_offset, 0)
                 dtype = None
+                dtype_byte = self.ntuple.column_records[key_nr].type
                 if interpreter == "cpu":
-                    content_generator = partial(
-                        self.ntuple.read_cluster_range,
-                        key_nr,
-                        start_cluster_idx,
-                        stop_cluster_idx,
-                        missing_element_padding=n_padding,
-                        array_cache=array_cache,
-                        access_log=access_log,
-                    )
+                    # A column can back several form keys, e.g. a collection's
+                    # offsets and its cardinality; read it only once.
+                    content_generator = column_readers.get(key_nr)
+                    if content_generator is None:
+                        content_generator = _read_once(
+                            partial(
+                                self.ntuple.read_cluster_range,
+                                key_nr,
+                                start_cluster_idx,
+                                stop_cluster_idx,
+                                missing_element_padding=n_padding,
+                                array_cache=array_cache,
+                                access_log=access_log,
+                            )
+                        )
+                        # switch columns are modified in place when filling
+                        # container_dict, so they are not shared
+                        if (
+                            dtype_byte
+                            != uproot.const.rntuple_col_type_to_num_dict["switch"]
+                        ):
+                            column_readers[key_nr] = content_generator
                     if virtual:
                         total_length, _, dtype = (
                             self.ntuple._expected_array_length_starts_dtype(
@@ -883,7 +902,6 @@ class HasFields(Mapping):
                     )
                 else:
                     raise NotImplementedError(f"Backend {backend} not implemented.")
-                dtype_byte = self.ntuple.column_records[key_nr].type
                 _fill_container_dict(container_dict, content, key, dtype_byte, dtype)
 
         arrays = ak.from_buffers(
@@ -1077,25 +1095,60 @@ class HasFields(Mapping):
         step_size = _regularize_step_size(
             self.ntuple, akform, step_size, entry_start, entry_stop
         )
-        # TODO: This can be done more efficiently
+        read = partial(
+            self.arrays,
+            filter_name=filter_name,
+            filter_typename=filter_typename,
+            filter_field=filter_field,
+            library=library,
+            backend=backend,
+            interpreter=interpreter,
+            how=how,
+            filter_branch=filter_branch,
+        )
+        # Every read decompresses whole clusters, and steps rarely line up with
+        # them. For Awkward output, read each cluster once and slice the steps
+        # out of it, instead of decompressing a cluster once per step.
+        by_cluster = (
+            uproot.interpretation.library._regularize_library(library).name == "ak"
+            and how is None
+            and interpreter == "cpu"
+        )
+        cluster_bounds = numpy.array(
+            [c.num_first_entry for c in self.ntuple.cluster_summaries]
+            + [self.ntuple.num_entries]
+        )
+        held_clusters = {}
         for start in range(entry_start, entry_stop, step_size):
-            arrays = self.arrays(
-                filter_name=filter_name,
-                filter_typename=filter_typename,
-                filter_field=filter_field,
-                entry_start=start,
-                entry_stop=min(start + step_size, entry_stop),
-                library=library,
-                backend=backend,
-                interpreter=interpreter,
-                how=how,
-                filter_branch=filter_branch,
-            )
-            if report:
-                sub_entry_stop = min(start + step_size, entry_stop)
-                yield arrays, uproot.behaviors.TBranch.Report(
-                    self, start, sub_entry_stop
+            stop = min(start + step_size, entry_stop)
+            if not by_cluster:
+                arrays = read(entry_start=start, entry_stop=stop)
+            else:
+                first = numpy.searchsorted(cluster_bounds, start, side="right") - 1
+                last = numpy.searchsorted(cluster_bounds, stop, side="left")
+                pieces = []
+                for idx in range(first, last):
+                    lo, hi = cluster_bounds[idx], cluster_bounds[idx + 1]
+                    if idx not in held_clusters:
+                        held_clusters[idx] = read(
+                            entry_start=int(lo), entry_stop=int(hi)
+                        )
+                    pieces.append(
+                        held_clusters[idx][max(start, lo) - lo : min(stop, hi) - lo]
+                    )
+                # pack the pieces so that only their entries are copied, not the
+                # whole clusters they are views of
+                arrays = (
+                    pieces[0]
+                    if len(pieces) == 1
+                    else ak.concatenate([ak.to_packed(p) for p in pieces])
                 )
+                # keep only the cluster that the next step starts in
+                next_idx = numpy.searchsorted(cluster_bounds, stop, side="right") - 1
+                for idx in [i for i in held_clusters if i < next_idx]:
+                    del held_clusters[idx]
+            if report:
+                yield arrays, uproot.behaviors.TBranch.Report(self, start, stop)
             else:
                 yield arrays
 
@@ -1877,7 +1930,11 @@ def _num_entries_for(ntuple, akform, target_num_bytes, entry_start, entry_stop):
     start_cluster_idx = (
         numpy.searchsorted(cluster_starts, entry_start, side="right") - 1
     )
-    stop_cluster_idx = numpy.searchsorted(cluster_starts, entry_stop, side="right")
+    # entry_stop is exclusive: a cluster starting at entry_stop is not needed
+    stop_cluster_idx = max(
+        numpy.searchsorted(cluster_starts, entry_stop, side="left"),
+        start_cluster_idx + 1,
+    )
 
     target_cols = []
     _recursive_find(akform, target_cols)
@@ -1910,6 +1967,17 @@ def _regularize_step_size(ntuple, akform, step_size, entry_start, entry_stop):
         f"(such as '100 MB') required, not {step_size!r}",
     )
     return _num_entries_for(ntuple, akform, target_num_bytes, entry_start, entry_stop)
+
+
+def _read_once(read):
+    result = []
+
+    def generator():
+        if not result:
+            result.append(read())
+        return result[0]
+
+    return generator
 
 
 def _recursive_find(form, res):

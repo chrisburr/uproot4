@@ -28,9 +28,11 @@ def test_rntuple_virtual_arrays_with_log():
 
     assert len(log) == 0
     assert ak.to_packed(virtual).layout.is_equal_to(ak.to_packed(eager).layout)
-    assert len(log) == 44
+    # one read per column, including the variant column that backs both the
+    # tags and the index buffers
+    assert len(log) == 42
     ak.materialize(virtual)
-    assert len(log) == 44
+    assert len(log) == 42
 
 
 def test_rntuple_virtual():

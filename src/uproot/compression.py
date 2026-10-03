@@ -112,7 +112,9 @@ class _DecompressZLIB:
 
         elif self.library == "deflate":
             deflate = uproot.extras.deflate()
-            return deflate.zlib_decompress(data, bufsize=uncompressed_bytes)
+            # The size is positional: deflate names it "originalsize" (>=0.6)
+            # and accepts no keywords at all in older releases.
+            return deflate.zlib_decompress(data, uncompressed_bytes)
 
         else:
             raise ValueError(
