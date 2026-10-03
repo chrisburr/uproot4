@@ -1081,25 +1081,60 @@ class HasFields(Mapping):
         step_size = _regularize_step_size(
             self.ntuple, akform, step_size, entry_start, entry_stop
         )
-        # TODO: This can be done more efficiently
+        read = partial(
+            self.arrays,
+            filter_name=filter_name,
+            filter_typename=filter_typename,
+            filter_field=filter_field,
+            library=library,
+            backend=backend,
+            interpreter=interpreter,
+            how=how,
+            filter_branch=filter_branch,
+        )
+        # Every read decompresses whole clusters, and steps rarely line up with
+        # them. For Awkward output, read each cluster once and slice the steps
+        # out of it, instead of decompressing a cluster once per step.
+        by_cluster = (
+            uproot.interpretation.library._regularize_library(library).name == "ak"
+            and how is None
+            and interpreter == "cpu"
+        )
+        cluster_bounds = numpy.array(
+            [c.num_first_entry for c in self.ntuple.cluster_summaries]
+            + [self.ntuple.num_entries]
+        )
+        held_clusters = {}
         for start in range(entry_start, entry_stop, step_size):
-            arrays = self.arrays(
-                filter_name=filter_name,
-                filter_typename=filter_typename,
-                filter_field=filter_field,
-                entry_start=start,
-                entry_stop=min(start + step_size, entry_stop),
-                library=library,
-                backend=backend,
-                interpreter=interpreter,
-                how=how,
-                filter_branch=filter_branch,
-            )
-            if report:
-                sub_entry_stop = min(start + step_size, entry_stop)
-                yield arrays, uproot.behaviors.TBranch.Report(
-                    self, start, sub_entry_stop
+            stop = min(start + step_size, entry_stop)
+            if not by_cluster:
+                arrays = read(entry_start=start, entry_stop=stop)
+            else:
+                first = numpy.searchsorted(cluster_bounds, start, side="right") - 1
+                last = numpy.searchsorted(cluster_bounds, stop, side="left")
+                pieces = []
+                for idx in range(first, last):
+                    lo, hi = cluster_bounds[idx], cluster_bounds[idx + 1]
+                    if idx not in held_clusters:
+                        held_clusters[idx] = read(
+                            entry_start=int(lo), entry_stop=int(hi)
+                        )
+                    pieces.append(
+                        held_clusters[idx][max(start, lo) - lo : min(stop, hi) - lo]
+                    )
+                # pack the pieces so that only their entries are copied, not the
+                # whole clusters they are views of
+                arrays = (
+                    pieces[0]
+                    if len(pieces) == 1
+                    else ak.concatenate([ak.to_packed(p) for p in pieces])
                 )
+                # keep only the cluster that the next step starts in
+                next_idx = numpy.searchsorted(cluster_bounds, stop, side="right") - 1
+                for idx in [i for i in held_clusters if i < next_idx]:
+                    del held_clusters[idx]
+            if report:
+                yield arrays, uproot.behaviors.TBranch.Report(self, start, stop)
             else:
                 yield arrays
 
